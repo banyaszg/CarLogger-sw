@@ -12,9 +12,10 @@
   #error "This library only works on the Electron and Photon"
 #endif
 
-#include "SdFat.h"
-
+//SYSTEM_MODE(SEMI_AUTOMATIC);
 SYSTEM_THREAD(ENABLED);
+
+#include "SdFat.h"
 
 // Primary SPI with DMA
 // SCK => A3, MISO => A4, MOSI => A5, SS => A2 (default)
@@ -23,14 +24,23 @@ const uint8_t chipSelect = SS;
 
 File logFile;
 uint8_t logSyncCnt;
-#define LOGSYNC 32
+#define LOGSYNC 16
 
 CANChannel can1(CAN_D1_D2);
 #ifdef SEC_CAN
 CANChannel can2(CAN_C4_C5);
 #endif
 
+const char SLCAN_NL = '\r';
+const char SLCAN_ACK = '\r';
+const char SLCAN_NACK = '\a';
+// SLCAN_CMD_LEN sizeof("T12345678811223344556677881234\r")+1
+#define SLCAN_CMD_LEN 32
+bool slcanTSEn = false;
+
 void logMessage(int ix, const CANMessage &message);
+void printMessage(const CANMessage &message);
+void parseSlcanCmd(char* buf);
 
 void reset_handler()
 {
@@ -44,7 +54,6 @@ void reset_handler()
 // setup() runs once, when the device is first turned on.
 void setup()
 {
-  // Put initialization like pinMode and begin functions here.
   Serial.begin(1000000);
   pinMode(D7, OUTPUT);
 
@@ -74,13 +83,13 @@ void setup()
 // loop() runs over and over again, as quickly as it can execute.
 void loop()
 {
-  // The core of your code will likely live here.
+  // Recv CAN
   if(can1.isEnabled()) {
     CANMessage message1;
     if(can1.receive(message1)) {
       logMessage(0, message1);
-      logSyncCnt++;
-      digitalWrite(D7, LOW);
+
+      printMessage(message1);
     }
   }
   #ifdef SEC_CAN
@@ -88,11 +97,11 @@ void loop()
     CANMessage message2;
     if(can2.receive(message2)) {
       logMessage(1, message2);
-      logSyncCnt++;
-      digitalWrite(D7, LOW);
     }
   }
   #endif
+
+  // Sync SD
   if(logSyncCnt >= LOGSYNC) {
     logSyncCnt = 0;
     digitalWrite(D7, HIGH);
@@ -102,11 +111,135 @@ void loop()
 
 void logMessage(int ix, const CANMessage &message)
 {
-  unsigned long time;
-  time = millis();
-  logFile.printf("(%d.%03d000) can%d %03x#", (time / 1000), (time % 1000), ix, message.id);
+  logFile.printf("(%010lu.%06lu) can%d %03x#", millis() / 1000, micros() % 1000000, ix, message.id);
   for(auto i = 0; i < message.len; i++) {
     logFile.printf("%02x", message.data[i]);
   }
   logFile.printf("\n");
+
+  logSyncCnt++;
+  digitalWrite(D7, LOW);
+}
+
+void printMessage(const CANMessage &msg)
+{
+  if(msg.extended) {
+    if(msg.rtr) {
+      Serial.printf("R%08X%01d", msg.id, msg.len);
+    } else {
+      Serial.printf("T%08X%01d", msg.id, msg.len);
+    }
+  } else {
+    if(msg.rtr) {
+      Serial.printf("r%03X%01d", msg.id, msg.len);
+    } else {
+      Serial.printf("t%03X%01d", msg.id, msg.len);
+    }
+  }
+  for(auto i = 0; i < msg.len; i++) {
+    Serial.printf("%02X", msg.data[i]);
+  }
+
+  // Timestamp
+  if(slcanTSEn) {
+    Serial.printf("%04X", millis() % 60000);
+  }
+
+  Serial.write(SLCAN_NL);
+}
+
+void slcan_ack()
+{
+  Serial.write(SLCAN_ACK); // ACK
+}
+
+void slcan_nack()
+{
+  Serial.write(SLCAN_NACK); // NACK
+}
+
+void serialEvent()
+{
+  int len;
+  static char cmdbuf[SLCAN_CMD_LEN];
+  static int cmdidx = 0;
+  char c;
+
+  if((len = Serial.available()) > 0) {
+    for(int i = 0; i < len; i++) {
+      c = Serial.read();
+      cmdbuf[cmdidx++] = c;
+
+      if (cmdidx == SLCAN_CMD_LEN) {
+        // Too long
+        slcan_nack();
+        cmdidx = 0;
+      } else if (c == SLCAN_NL) {
+        // Command packet
+        cmdbuf[cmdidx] = '\0';
+        parseSlcanCmd(cmdbuf);
+        cmdidx = 0;
+      }
+    }
+  }
+}
+
+void parseSlcanCmd(char* buf)
+{
+  switch(buf[0])
+  {
+    case 'S': // Setup with standard CAN bit-rates where n is 0-8.
+      // unused
+      slcan_ack();
+      break;
+    case 's': // direct bitrate register
+      slcan_nack();
+      break;
+    case 'O': // Open the CAN channel.
+      // unused
+      slcan_ack();
+      break;
+    case 'C': // Close the CAN channel.
+      // unused
+      slcan_ack();
+      break;
+    case 't': // Transmit a standard (11bit) CAN frame.
+    case 'T': // Transmit an extended (29bit) CAN frame.
+    case 'r': // Transmit an standard RTR (11bit) CAN frame.
+    case 'R': // Transmit an extended RTR (29bit) CAN frame.
+      // unused
+      slcan_ack();
+      break;
+    case 'F': // Read Status Flags.
+      Serial.print("F00");
+      slcan_ack();
+      break;
+    case 'M': // Acceptance Code (SJA1000)
+      slcan_ack();
+      break;
+    case 'm': //  Acceptance Mask (SJA1000)
+      slcan_ack();
+      break;
+    case 'V': // Version
+      Serial.print("V0001");
+      slcan_ack();
+      break;
+    case 'N': // Serial number
+      Serial.print("N0001");
+      slcan_ack();
+      break;
+    case 'Z': // Sets Time Stamp ON/OFF
+      if(buf[1] == '0') {
+        slcanTSEn = false;
+      } else if (buf[1] == '1') {
+        slcanTSEn = true;
+      } else {
+        slcan_nack();
+      }
+      slcan_ack();
+      break;
+    default: // unknown command
+      slcan_nack();
+      break;
+  }
 }
