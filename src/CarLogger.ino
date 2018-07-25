@@ -97,6 +97,12 @@ void loop()
     CANMessage message2;
     if(can2.receive(message2)) {
       logMessage(1, message2);
+
+      /* HACK: CAN over Serial protocol supports only 1 CAN bus
+       * We merge in the CAN2 communication and the bit10 in the ID indicates it.
+       */
+      message2.id |= 0x400;
+      printMessage(message2);
     }
   }
   #endif
